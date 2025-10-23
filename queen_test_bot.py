@@ -4,7 +4,6 @@ import time
 import requests
 import logging
 
-logging.basicConfig(level=logging.INFO)
 
 # === CONFIG ===
 BOT_TOKEN = "8465030829:AAG3-7ZIQGiTuWwhUeQNsv66f24mabMwqcY"
@@ -63,14 +62,13 @@ def send_question(user_id):
         except Exception:
             pass
 
-    msg = bot.send_message(user_id, f"❓ {q['question_text']}", reply_markup=markup)
+    msg = bot.send_message(
+        user_id, f"❓ {q['question_text']}", reply_markup=markup)
     user_data[user_id]["last_msg_id"] = msg.message_id
-    print("вопрос отправил")
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_answer(call):
-    print(f"1,{call.data}")
     user_id = call.message.chat.id
     data = user_data.get(user_id)
     if not data:
@@ -86,7 +84,8 @@ def handle_answer(call):
         bot.register_next_step_handler(msg, handle_custom_input)
         return
 
-    data["answers"].append({"question": question["question_text"], "answer": call.data})
+    data["answers"].append(
+        {"question": question["question_text"], "answer": call.data})
     data["current_q"] += 1
     bot.answer_callback_query(call.id)
 
@@ -114,6 +113,7 @@ def handle_custom_input(message):
     data["current_q"] += 1
 
     try:
+        bot.delete_message(user_id, message.message_id-1)
         bot.delete_message(user_id, message.message_id)
     except Exception:
         pass
