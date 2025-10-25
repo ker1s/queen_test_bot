@@ -10,9 +10,12 @@ BOT_TOKEN = "8465030829:AAG3-7ZIQGiTuWwhUeQNsv66f24mabMwqcY"
 bot = telebot.TeleBot(BOT_TOKEN)
 QUESTIONS_PATH = "questions.json"
 PROMPTS_PATH = "prompts.json"
-OPENROUTER_API_KEY = "ТОКЕН_OPENROUTER"
-LLM_MODEL = "openrouter/model-name"
-TEXT2IMG_MODEL = "openrouter/image-model"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = (
+    "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"
+)
+LLM_MODEL = "x-ai/grok-4-fast"
+TEXT2IMG_MODEL = "google/gemini-2.5-flash-image-preview"
 
 # === STORAGE ===
 user_data = {}
@@ -41,7 +44,11 @@ def first_message(message):
     markup.add(start_test)
     bot.send_message(
         message.from_user.id,
-        "Привет!\nВсе мы знаем зачем ты тут😈😈😈. Начинаем?",
+        "Привет!\nПриветствую тебя в тесте на звание настоящей женщины.",
+    )
+    bot.send_message(
+        message.from_user.id,
+        "Готова начинать?😈😈😈",
         reply_markup=markup,
     )
 
@@ -128,7 +135,10 @@ def handle_answer(call):
 
             if 0 <= opt_index < len(question["options"]):
                 selected_option = question["options"][opt_index]
-                data["answers"].append(selected_option)
+                # Сохраняем в том же формате, что и при ручном вводе
+                data["answers"].append(
+                    {"question": question["question_text"], "answer": selected_option}
+                )
                 data["current_q"] += 1
 
                 # Удаляем старое сообщение с вопросом
@@ -203,6 +213,7 @@ def finish_test(user_id):
         caption=f"🧠 {characteristic}",
         reply_markup=markup,
     )
+    print(answers_json)
 
 
 # === LLM (характеристика) ===
@@ -215,29 +226,78 @@ def generate_characteristic(answers_json):
     body = {
         "model": LLM_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": "Ты создаёшь абсурдные, острые и саркастичные характеристики девушек по тестам.",
-            },
+            {"role": "system", "content": REPORT_PROMPT},
             {"role": "user", "content": prompt},
         ],
     }
 
-    # временный мок
-    return "Ты — ходячий хаос и ангел абсурда с лычкой «main cringe character»."
+    response = requests.post(
+        OPENROUTER_URL,
+        headers=headers,
+        data=json.dumps(body, ensure_ascii=False),
+        timeout=90,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    try:
+        return payload["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected OpenRouter response: {payload}")
 
 
 # === IMG GEN (портрет) ===
 def generate_image(description):
-    prompt = IMG_GEN_PROMPT.replace("{{characteristic}}", description)
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-    body = {"model": TEXT2IMG_MODEL, "prompt": prompt}
 
-    # временный мок
-    return "https://placekitten.com/512/512"
+    body = {
+        "model": TEXT2IMG_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": IMG_GEN_PROMPT},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": description},
+                ],
+            },
+        ],
+        # пример дополнительных настроек:
+        # "extra": {"image_size": "1024x1024"},
+    }
+
+    response = requests.post(
+        OPENROUTER_URL,
+        headers=headers,
+        data=json.dumps(body, ensure_ascii=False),
+        timeout=240,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    try:
+        content_blocks = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Unexpected OpenRouter response: {payload}")
+
+    for block in content_blocks:
+        if isinstance(block, dict) and block.get("type") == "output_image":
+            image_url = block.get("image_url")
+            if isinstance(image_url, dict):
+                url = image_url.get("url")
+                if url:
+                    return url.strip()
+            elif isinstance(image_url, str) and image_url:
+                return image_url.strip()
+
+    raise RuntimeError(f"No output_image block in OpenRouter response: {payload}")
 
 
 # telebot.logger.setLevel(logging.DEBUG)
