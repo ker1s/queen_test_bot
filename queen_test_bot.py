@@ -30,6 +30,22 @@ IMG_GEN_PROMPT = PROMPTS["img_gen"]
 
 
 @bot.message_handler(commands=["start"])
+def first_message(message):
+    user_id = message.chat.id
+    bot.delete_message(user_id, message.message_id)
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    start_test = telebot.types.InlineKeyboardButton(
+        text="Начать тестирование", callback_data="start_test"
+    )
+    markup.add(start_test)
+    bot.send_message(
+        message.from_user.id,
+        "Привет!\nВсе мы знаем зачем ты тут😈😈😈. Начинаем?",
+        reply_markup=markup,
+    )
+
+
 def start_test(message):
     user_id = message.chat.id
     bot.delete_message(user_id, message.message_id)
@@ -48,8 +64,11 @@ def send_question(user_id):
     q = QUESTIONS[q_index]
     markup = telebot.types.InlineKeyboardMarkup()
 
-    for opt in q["options"]:
-        markup.add(telebot.types.InlineKeyboardButton(opt, callback_data=opt))
+    # Используем индексы вместо полного текста для callback_data
+    for idx, opt in enumerate(q["options"]):
+        # callback_data должен быть коротким (1-64 байта)
+        markup.add(telebot.types.InlineKeyboardButton(opt, callback_data=f"opt_{idx}"))
+
     markup.add(
         telebot.types.InlineKeyboardButton(
             "✏️ Свой вариант", callback_data="custom_input"
@@ -62,8 +81,7 @@ def send_question(user_id):
         except Exception:
             pass
 
-    msg = bot.send_message(
-        user_id, f"❓ {q['question_text']}", reply_markup=markup)
+    msg = bot.send_message(user_id, f"❓ {q['question_text']}", reply_markup=markup)
     user_data[user_id]["last_msg_id"] = msg.message_id
 
 
@@ -71,12 +89,19 @@ def send_question(user_id):
 def handle_answer(call):
     user_id = call.message.chat.id
     data = user_data.get(user_id)
-    if not data:
-        bot.answer_callback_query(call.id, "Начни с /start")
-        return
 
-    q_index = data["current_q"]
-    question = QUESTIONS[q_index]
+    if call.data == "start_test":
+        bot.answer_callback_query(call.id)
+
+        class MockMessage:
+            def __init__(self, chat_id):
+                self.chat = type("Chat", (), {"id": chat_id})()
+                self.message_id = call.message.message_id
+                self.from_user = call.from_user
+
+        msg = MockMessage(user_id)
+        start_test(msg)
+        return
 
     if call.data == "custom_input":
         bot.answer_callback_query(call.id)
@@ -84,17 +109,40 @@ def handle_answer(call):
         bot.register_next_step_handler(msg, handle_custom_input)
         return
 
-    data["answers"].append(
-        {"question": question["question_text"], "answer": call.data})
-    data["current_q"] += 1
-    bot.answer_callback_query(call.id)
+    if call.data == "message_from_author":
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(user_id, "Сообщение от автора")
+        user_data.pop(user_id, None)
+        return
 
-    try:
-        bot.delete_message(user_id, data["last_msg_id"])
-    except Exception:
-        pass
+    if not data:
+        bot.answer_callback_query(call.id, "Начни с /start")
+        return
 
-    send_question(user_id)
+    # Обрабатываем выбор опции
+    if call.data.startswith("opt_"):
+        try:
+            opt_index = int(call.data.split("_")[1])
+            q_index = data["current_q"]
+            question = QUESTIONS[q_index]
+
+            if 0 <= opt_index < len(question["options"]):
+                selected_option = question["options"][opt_index]
+                data["answers"].append(selected_option)
+                data["current_q"] += 1
+
+                # Удаляем старое сообщение с вопросом
+                try:
+                    bot.delete_message(user_id, call.message.message_id)
+                except Exception:
+                    pass
+
+                send_question(user_id)
+                bot.answer_callback_query(call.id)
+            else:
+                bot.answer_callback_query(call.id, "Неверный вариант")
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "Ошибка обработки ответа")
 
 
 def handle_custom_input(message):
@@ -113,7 +161,7 @@ def handle_custom_input(message):
     data["current_q"] += 1
 
     try:
-        bot.delete_message(user_id, message.message_id-1)
+        bot.delete_message(user_id, message.message_id - 1)
         bot.delete_message(user_id, message.message_id)
     except Exception:
         pass
@@ -144,8 +192,17 @@ def finish_test(user_id):
     except Exception:
         pass
 
-    bot.send_photo(user_id, image_url, caption=f"🧠 {characteristic}")
-    user_data.pop(user_id, None)
+    markup = telebot.types.InlineKeyboardMarkup()
+    start_test = telebot.types.InlineKeyboardButton(
+        text="Сообщение от создателя", callback_data="message_from_author"
+    )
+    markup.add(start_test)
+    bot.send_photo(
+        user_id,
+        image_url,
+        caption=f"🧠 {characteristic}",
+        reply_markup=markup,
+    )
 
 
 # === LLM (характеристика) ===
