@@ -3,6 +3,11 @@ import json
 import time
 import requests
 import logging
+import base64
+from io import BytesIO
+import argparse
+from datetime import datetime
+from pathlib import Path
 
 
 # === CONFIG ===
@@ -15,7 +20,9 @@ OPENROUTER_API_KEY = (
     "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"
 )
 LLM_MODEL = "x-ai/grok-4-fast"
-TEXT2IMG_MODEL = "google/gemini-2.5-flash-image-preview"
+TEXT2IMG_MODEL = "openai/gpt-5-image"
+
+PHOTO_CAPTION_LIMIT = 1024
 
 # === STORAGE ===
 user_data = {}
@@ -32,6 +39,42 @@ IMG_GEN_PROMPT = PROMPTS["img_gen"]
 # === START ===
 
 
+def setup_logging() -> logging.Logger:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging severity threshold",
+    )
+    args, unknown = parser.parse_known_args()
+    logging.root.setLevel(logging.NOTSET)
+
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    log_file = log_dir / f"queen-bot-{timestamp}.log"
+
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler(log_file, encoding="utf-8"),
+    ]
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
+
+    bot_logger = logging.getLogger("telebot")
+    bot_logger.setLevel(getattr(logging, args.log_level))
+
+    logging.getLogger(__name__).info(
+        "Log file created at %s with level %s", log_file, args.log_level
+    )
+    return logging.getLogger(__name__)
+
+
 @bot.message_handler(commands=["start"])
 def first_message(message):
     user_id = message.chat.id
@@ -44,11 +87,11 @@ def first_message(message):
     markup.add(start_test)
     bot.send_message(
         message.from_user.id,
-        "Привет!\nПриветствую тебя в тесте на звание настоящей женщины.",
+        "Приветствую на тесте на звание настоящей женщины.",
     )
     bot.send_message(
         message.from_user.id,
-        "Готова начинать?😈😈😈",
+        "Готовы начинать?😈😈😈",
         reply_markup=markup,
     )
 
@@ -74,7 +117,8 @@ def send_question(user_id):
     # Используем индексы вместо полного текста для callback_data
     for idx, opt in enumerate(q["options"]):
         # callback_data должен быть коротким (1-64 байта)
-        markup.add(telebot.types.InlineKeyboardButton(opt, callback_data=f"opt_{idx}"))
+        markup.add(telebot.types.InlineKeyboardButton(
+            opt, callback_data=f"opt_{idx}"))
 
     markup.add(
         telebot.types.InlineKeyboardButton(
@@ -88,7 +132,8 @@ def send_question(user_id):
         except Exception:
             pass
 
-    msg = bot.send_message(user_id, f"❓ {q['question_text']}", reply_markup=markup)
+    msg = bot.send_message(
+        user_id, f"❓ {q['question_text']}", reply_markup=markup)
     user_data[user_id]["last_msg_id"] = msg.message_id
 
 
@@ -97,62 +142,63 @@ def handle_answer(call):
     user_id = call.message.chat.id
     data = user_data.get(user_id)
 
-    if call.data == "start_test":
+    # отвечаем один раз — дальше повторять нельзя
+    try:
         bot.answer_callback_query(call.id)
+    except Exception:
+        logger.warning("Failed to answer callback_query %s",
+                       call.id, exc_info=True)
 
+    if call.data == "start_test":
         class MockMessage:
             def __init__(self, chat_id):
                 self.chat = type("Chat", (), {"id": chat_id})()
                 self.message_id = call.message.message_id
                 self.from_user = call.from_user
 
-        msg = MockMessage(user_id)
-        start_test(msg)
+        start_test(MockMessage(user_id))
         return
 
     if call.data == "custom_input":
-        bot.answer_callback_query(call.id)
         msg = bot.send_message(user_id, "✏️ Введи свой вариант:")
         bot.register_next_step_handler(msg, handle_custom_input)
         return
 
     if call.data == "message_from_author":
-        bot.answer_callback_query(call.id)
-        msg = bot.send_message(user_id, "Сообщение от автора")
+        bot.send_message(
+            user_id,
+            "Дорогие дамы я надеюсь вы поняли что все тесты полная хуйня, огромное вам спасибо что вы есть. Оставайтесь такими какие есть вы все крутые😘😘😘. Обняли🫂."
+        )
         user_data.pop(user_id, None)
         return
 
     if not data:
-        bot.answer_callback_query(call.id, "Начни с /start")
-        return
+        return  # можно отправить текст первым вызовом, если нужно уведомление
 
-    # Обрабатываем выбор опции
     if call.data.startswith("opt_"):
         try:
             opt_index = int(call.data.split("_")[1])
-            q_index = data["current_q"]
-            question = QUESTIONS[q_index]
-
-            if 0 <= opt_index < len(question["options"]):
-                selected_option = question["options"][opt_index]
-                # Сохраняем в том же формате, что и при ручном вводе
-                data["answers"].append(
-                    {"question": question["question_text"], "answer": selected_option}
-                )
-                data["current_q"] += 1
-
-                # Удаляем старое сообщение с вопросом
-                try:
-                    bot.delete_message(user_id, call.message.message_id)
-                except Exception:
-                    pass
-
-                send_question(user_id)
-                bot.answer_callback_query(call.id)
-            else:
-                bot.answer_callback_query(call.id, "Неверный вариант")
         except (ValueError, IndexError):
-            bot.answer_callback_query(call.id, "Ошибка обработки ответа")
+            bot.send_message(user_id, "Ошибка обработки ответа")
+            return
+
+        question = QUESTIONS[data["current_q"]]
+        if not (0 <= opt_index < len(question["options"])):
+            bot.send_message(user_id, "Неверный вариант")
+            return
+
+        selected_option = question["options"][opt_index]
+        data["answers"].append(
+            {"question": question["question_text"], "answer": selected_option}
+        )
+        data["current_q"] += 1
+
+        try:
+            bot.delete_message(user_id, call.message.message_id)
+        except Exception:
+            pass
+
+        send_question(user_id)
 
 
 def handle_custom_input(message):
@@ -185,40 +231,65 @@ def finish_test(user_id):
     except Exception:
         pass
 
-    msg = bot.send_message(
-        user_id, "🤖 Обрабатываем твои ответы... подожди пару секунд 💅"
-    )
-    user_data[user_id]["last_msg_id"] = msg.message_id
+    with open('./cat-kitty.gif', 'rb') as gif:
+        progress_msg = bot.send_animation(
+            chat_id=user_id,
+            animation=gif,
+            caption="🤖 Обрабатываем ваши ответы... подождите пожалуйста несколько минут 💅"
+        )
+
+    user_data[user_id]["last_msg_id"] = progress_msg.message_id
 
     answers_json = json.dumps(
         user_data[user_id]["answers"], ensure_ascii=False, indent=2
     )
 
     characteristic = generate_characteristic(answers_json)
-    image_url = generate_image(characteristic)
+    image_payload = generate_image(characteristic)
 
     try:
-        bot.delete_message(user_id, msg.message_id)
+        bot.delete_message(user_id, progress_msg.message_id)
     except Exception:
         pass
 
     markup = telebot.types.InlineKeyboardMarkup()
-    start_test = telebot.types.InlineKeyboardButton(
-        text="Сообщение от создателя", callback_data="message_from_author"
+    markup.add(
+        telebot.types.InlineKeyboardButton(
+            text="Сообщение от авторов", callback_data="message_from_author"
+        )
     )
-    markup.add(start_test)
-    bot.send_photo(
+
+    if image_payload["kind"] == "url" and image_payload["data"].startswith("data:image/"):
+        header, b64_data = image_payload["data"].split(",", 1)
+        mime = header.split(";")[0].split(":", 1)[1]
+        image_payload = {"kind": "base64", "data": b64_data, "mime": mime}
+
+    if image_payload["kind"] == "url":
+        logger.info("Sending image to Telegram via URL (no caption)")
+        bot.send_photo(
+            user_id,
+            image_payload["data"],
+        )
+    else:
+        logger.info("Sending image to Telegram via base64 (%s bytes)",
+                    len(image_payload["data"]))
+        image_bytes = base64.b64decode(image_payload["data"])
+        bio = BytesIO(image_bytes)
+        bio.name = "character.png"
+        bot.send_photo(
+            user_id,
+            bio,
+        )
+    bot.send_message(
         user_id,
-        image_url,
-        caption=f"🧠 {characteristic}",
+        f"🧠 {characteristic}",
+        parse_mode="HTML",
         reply_markup=markup,
     )
-    print(answers_json)
 
 
 # === LLM (характеристика) ===
 def generate_characteristic(answers_json):
-    prompt = REPORT_PROMPT.replace("{{answers}}", answers_json)
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -227,7 +298,7 @@ def generate_characteristic(answers_json):
         "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": REPORT_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": answers_json},
         ],
     }
 
@@ -247,60 +318,113 @@ def generate_characteristic(answers_json):
 
 
 # === IMG GEN (портрет) ===
-def generate_image(description):
+def generate_image(description, retries=2, backoff=3):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-
     body = {
         "model": TEXT2IMG_MODEL,
+        "modalities": ["image"],
         "messages": [
-            {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": IMG_GEN_PROMPT},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": description},
-                ],
-            },
+            {"role": "system", "content": [
+                {"type": "text", "text": IMG_GEN_PROMPT}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": description}]},
         ],
-        # пример дополнительных настроек:
-        # "extra": {"image_size": "1024x1024"},
     }
 
-    response = requests.post(
-        OPENROUTER_URL,
-        headers=headers,
-        data=json.dumps(body, ensure_ascii=False),
-        timeout=240,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    def parse_image_resource(resource):
+        def from_data_url(url: str):
+            header, b64_data = url.split(",", 1)
+            mime = header.split(";")[0].split(":", 1)[1]
+            return {"kind": "base64", "data": b64_data, "mime": mime}
+        if isinstance(resource, str):
+            if resource.startswith("data:image/"):
+                return from_data_url(resource)
+            return {"kind": "url", "data": resource}
+        if isinstance(resource, dict) and resource.get("url"):
+            inner_url = resource["url"]
+            if isinstance(inner_url, str) and inner_url.startswith("data:image/"):
+                return from_data_url(inner_url)
+            return {"kind": "url", "data": inner_url}
+        return None
 
-    try:
-        content_blocks = payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        raise RuntimeError(f"Unexpected OpenRouter response: {payload}")
+    def extract_image(message):
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "output_image":
+                image_url = block.get("image_url")
+                parsed = parse_image_resource(image_url)
+                if parsed:
+                    logger.info(
+                        "Image payload received via content (kind=%s)", parsed["kind"])
+                    return parsed
+                for key in ("image_base64", "b64_json"):
+                    if block.get(key):
+                        logger.info(
+                            "Image payload received via %s in content", key)
+                        return {
+                            "kind": "base64",
+                            "data": block[key],
+                            "mime": block.get("mime_type", "image/png"),
+                        }
+        for image_item in message.get("images") or []:
+            if not isinstance(image_item, dict):
+                continue
+            if image_item.get("type") == "image_url":
+                parsed = parse_image_resource(image_item.get("image_url"))
+                if parsed:
+                    logger.info(
+                        "Image payload received via images[] (kind=%s)", parsed["kind"])
+                    return parsed
+            if image_item.get("type") == "image_base64" and image_item.get("image_base64"):
+                logger.info(
+                    "Image payload received via image_base64 in images[]")
+                return {
+                    "kind": "base64",
+                    "data": image_item["image_base64"],
+                    "mime": image_item.get("mime_type", "image/png"),
+                }
+        return None
 
-    for block in content_blocks:
-        if isinstance(block, dict) and block.get("type") == "output_image":
-            image_url = block.get("image_url")
-            if isinstance(image_url, dict):
-                url = image_url.get("url")
-                if url:
-                    return url.strip()
-            elif isinstance(image_url, str) and image_url:
-                return image_url.strip()
+    for attempt in range(retries + 1):
+        response = requests.post(
+            OPENROUTER_URL,
+            headers=headers,
+            json=body,
+            timeout=240,
+        )
+        response.raise_for_status()
+        payload = response.json()
 
-    raise RuntimeError(f"No output_image block in OpenRouter response: {payload}")
+        choice = (payload.get("choices") or [{}])[0]
+        error_block = choice.get("error")
+        if error_block:
+            logger.warning(
+                "Image generation error (code=%s, req_id=%s): %s",
+                error_block.get("code"),
+                error_block.get("metadata", {}).get("provider_request_id")
+                or error_block.get("metadata", {}).get("request_id"),
+                error_block.get("message"),
+            )
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            raise RuntimeError(f"Image generation failed: {payload}")
+
+        message = choice.get("message") or {}
+        image_payload = extract_image(message)
+        if image_payload:
+            return image_payload
+
+        logger.warning("No image found in response on attempt %d", attempt + 1)
+
+    raise RuntimeError(
+        f"No image payload found in OpenRouter response: {payload}")
 
 
-# telebot.logger.setLevel(logging.DEBUG)
+logger = setup_logging()
+
 bot.remove_webhook()
 
 bot.infinity_polling(
