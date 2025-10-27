@@ -100,7 +100,13 @@ def start_test(message):
     user_id = message.chat.id
     bot.delete_message(user_id, message.message_id)
 
-    user_data[user_id] = {"answers": [], "current_q": 0, "last_msg_id": None}
+    user_data[user_id] = {
+        "answers": [],
+        "current_q": 0,
+        "last_msg_id": None,
+        "awaiting_photo": False,
+        "characteristic": None,
+    }
     send_question(user_id)
 
 
@@ -189,7 +195,8 @@ def handle_answer(call):
 
         selected_option = question["options"][opt_index]
         data["answers"].append(
-            {"question": question["question_text"], "answer": selected_option}
+            {"question": question["question_text"],
+                "options": question["options"], "answer": selected_option}
         )
         data["current_q"] += 1
 
@@ -226,65 +233,31 @@ def handle_custom_input(message):
 
 
 def finish_test(user_id):
+    data = user_data[user_id]
+
     try:
-        bot.delete_message(user_id, user_data[user_id]["last_msg_id"])
+        bot.delete_message(user_id, data.get("last_msg_id"))
     except Exception:
         pass
 
-    with open('./cat-kitty.gif', 'rb') as gif:
-        progress_msg = bot.send_animation(
-            chat_id=user_id,
-            animation=gif,
-            caption="🤖 Обрабатываем ваши ответы... подождите пожалуйста несколько минут 💅"
-        )
-
-    user_data[user_id]["last_msg_id"] = progress_msg.message_id
-
     answers_json = json.dumps(
-        user_data[user_id]["answers"], ensure_ascii=False, indent=2
+        data["answers"],
+        ensure_ascii=False,
+        indent=2,
     )
 
     characteristic = generate_characteristic(answers_json)
-    image_payload = generate_image(characteristic)
+    data["characteristic"] = characteristic
+    data["awaiting_photo"] = True
+    data["last_msg_id"] = None
 
-    try:
-        bot.delete_message(user_id, progress_msg.message_id)
-    except Exception:
-        pass
-
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(
-        telebot.types.InlineKeyboardButton(
-            text="Сообщение от авторов", callback_data="message_from_author"
-        )
-    )
-
-    if image_payload["kind"] == "url" and image_payload["data"].startswith("data:image/"):
-        header, b64_data = image_payload["data"].split(",", 1)
-        mime = header.split(";")[0].split(":", 1)[1]
-        image_payload = {"kind": "base64", "data": b64_data, "mime": mime}
-
-    if image_payload["kind"] == "url":
-        logger.info("Sending image to Telegram via URL (no caption)")
-        bot.send_photo(
-            user_id,
-            image_payload["data"],
-        )
-    else:
-        logger.info("Sending image to Telegram via base64 (%s bytes)",
-                    len(image_payload["data"]))
-        image_bytes = base64.b64decode(image_payload["data"])
-        bio = BytesIO(image_bytes)
-        bio.name = "character.png"
-        bot.send_photo(
-            user_id,
-            bio,
-        )
     bot.send_message(
         user_id,
-        f"🧠 {characteristic}",
-        parse_mode="HTML",
-        reply_markup=markup,
+        (
+            "Отлично! Теперь пришлите своё фото (селфи или портрет), оно нужно для подведения итогов.\n"
+            "Фото не сохраняется и никуда не передаётся — оно остаётся только в вашем телефоне.\n"
+            "Отправьте его как обычное фото, не как файл."
+        ),
     )
 
 
@@ -318,19 +291,26 @@ def generate_characteristic(answers_json):
 
 
 # === IMG GEN (портрет) ===
-def generate_image(description, retries=2, backoff=3):
+def generate_image(description, reference_image_b64=None, retries=2, backoff=3):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
+    user_content = [{"type": "text", "text": description}]
+    if reference_image_b64:
+        user_content.append(
+            {"type": "input_image", "image_base64": reference_image_b64}
+        )
+
     body = {
         "model": TEXT2IMG_MODEL,
         "modalities": ["image"],
         "messages": [
-            {"role": "system", "content": [
-                {"type": "text", "text": IMG_GEN_PROMPT}]},
-            {"role": "user", "content": [
-                {"type": "text", "text": description}]},
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": IMG_GEN_PROMPT}],
+            },
+            {"role": "user", "content": user_content},
         ],
     }
 
@@ -357,7 +337,8 @@ def generate_image(description, retries=2, backoff=3):
                 parsed = parse_image_resource(image_url)
                 if parsed:
                     logger.info(
-                        "Image payload received via content (kind=%s)", parsed["kind"])
+                        "Image payload received via content (kind=%s)", parsed["kind"]
+                    )
                     return parsed
                 for key in ("image_base64", "b64_json"):
                     if block.get(key):
@@ -375,7 +356,8 @@ def generate_image(description, retries=2, backoff=3):
                 parsed = parse_image_resource(image_item.get("image_url"))
                 if parsed:
                     logger.info(
-                        "Image payload received via images[] (kind=%s)", parsed["kind"])
+                        "Image payload received via images[] (kind=%s)", parsed["kind"]
+                    )
                     return parsed
             if image_item.get("type") == "image_base64" and image_item.get("image_base64"):
                 logger.info(
@@ -421,6 +403,121 @@ def generate_image(description, retries=2, backoff=3):
 
     raise RuntimeError(
         f"No image payload found in OpenRouter response: {payload}")
+
+
+@bot.message_handler(content_types=["photo"])
+def handle_user_photo(message):
+    user_id = message.chat.id
+    data = user_data.get(user_id)
+    if not data or not data.get("awaiting_photo"):
+        return
+
+    try:
+        file_info = bot.get_file(message.photo[-1].file_id)
+        photo_bytes = bot.download_file(file_info.file_path)
+    except Exception:
+        logger.warning("Failed to download user photo for %s",
+                       user_id, exc_info=True)
+        bot.send_message(
+            user_id,
+            "Не удалось получить фото. Попробуй отправить его ещё раз как обычное изображение.",
+        )
+        return
+
+    photo_b64 = base64.b64encode(photo_bytes).decode("utf-8")
+    del photo_bytes
+
+    progress_msg = None
+    try:
+        with open("./cat-kitty.gif", "rb") as gif:
+            progress_msg = bot.send_animation(
+                chat_id=user_id,
+                animation=gif,
+                caption="🤖 Обрабатываем ваше фото... это займёт пару минут 💅",
+            )
+
+        image_payload = generate_image(
+            data["characteristic"],
+            reference_image_b64=photo_b64,
+        )
+    except Exception:
+        logger.exception("Photo-based generation failed for %s", user_id)
+        if progress_msg:
+            try:
+                bot.delete_message(user_id, progress_msg.message_id)
+            except Exception:
+                pass
+        bot.send_message(
+            user_id,
+            "Не вышло обработать фото. Пришли другое изображение или попробуй позже.",
+        )
+        data["awaiting_photo"] = True
+        photo_b64 = None
+        return
+    finally:
+        if progress_msg:
+            try:
+                bot.delete_message(user_id, progress_msg.message_id)
+            except Exception:
+                pass
+        photo_b64 = None
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(
+        telebot.types.InlineKeyboardButton(
+            text="Сообщение от авторов", callback_data="message_from_author"
+        )
+    )
+
+    if image_payload["kind"] == "url" and image_payload["data"].startswith("data:image/"):
+        header, b64_data = image_payload["data"].split(",", 1)
+        mime = header.split(";")[0].split(":", 1)[1]
+        image_payload = {"kind": "base64", "data": b64_data, "mime": mime}
+
+    if image_payload["kind"] == "url":
+        logger.info("Sending image to Telegram via URL (no caption)")
+        bot.send_photo(user_id, image_payload["data"])
+    else:
+        logger.info(
+            "Sending image to Telegram via base64 (%s bytes)",
+            len(image_payload["data"]),
+        )
+        image_bytes = base64.b64decode(image_payload["data"])
+        bio = BytesIO(image_bytes)
+        bio.name = "character.png"
+        bot.send_photo(user_id, bio)
+
+    bot.send_message(
+        user_id,
+        f"🧠 {data['characteristic']}",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+    data["awaiting_photo"] = False
+
+
+@bot.message_handler(
+    func=lambda message: user_data.get(
+        message.chat.id, {}).get("awaiting_photo"),
+    content_types=[
+        "text",
+        "document",
+        "audio",
+        "video",
+        "voice",
+        "video_note",
+        "sticker",
+        "animation",
+        "location",
+        "contact",
+    ],
+)
+def handle_non_photo_during_upload(message):
+    bot.send_message(
+        message.chat.id,
+        "Чтобы продолжить, пришли своё фото как обычное изображение. "
+        "Мы его не сохраняем и никому не передаём.",
+    )
 
 
 logger = setup_logging()
