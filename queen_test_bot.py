@@ -8,6 +8,8 @@ from io import BytesIO
 import argparse
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
+from threading import Thread, Lock
 
 
 # === CONFIG ===
@@ -27,6 +29,10 @@ PHOTO_CAPTION_LIMIT = 1024
 # === STORAGE ===
 user_data = {}
 
+# === QUEUE FOR OPENROUTER REQUESTS ===
+openrouter_queue = Queue()
+queue_lock = Lock()
+
 # === LOAD QUESTIONS & PROMPTS ===
 with open(QUESTIONS_PATH, "r", encoding="utf-8") as f:
     QUESTIONS = json.load(f)
@@ -36,7 +42,7 @@ with open(PROMPTS_PATH, "r", encoding="utf-8") as f:
 REPORT_PROMPT = PROMPTS["report"]
 IMG_GEN_PROMPT = PROMPTS["img_gen"]
 
-# === START ===
+# === LOGGING SETUP ===
 
 
 def setup_logging() -> logging.Logger:
@@ -75,6 +81,45 @@ def setup_logging() -> logging.Logger:
     return logging.getLogger(__name__)
 
 
+# === OPENROUTER QUEUE WORKER ===
+def openrouter_worker():
+    """Обрабатывает запросы к OpenRouter по одному из очереди"""
+    while True:
+        task = openrouter_queue.get()
+        if task is None:
+            break
+        
+        try:
+            task_type = task["type"]
+            user_id = task["user_id"]
+            
+            if task_type == "characteristic":
+                answers_json = task["answers_json"]
+                try:
+                    characteristic = generate_characteristic(answers_json)
+                    task["callback"](user_id, characteristic, None)
+                except Exception as e:
+                    logger.exception("Failed to generate characteristic for %s", user_id)
+                    task["callback"](user_id, None, str(e))
+            
+            elif task_type == "image":
+                description = task["description"]
+                try:
+                    image_payload = generate_image(description)
+                    task["callback"](user_id, image_payload, None)
+                except Exception as e:
+                    logger.exception("Failed to generate image for %s", user_id)
+                    task["callback"](user_id, None, str(e))
+        
+        except Exception as e:
+            logger.exception("Unexpected error in openrouter_worker")
+        
+        finally:
+            openrouter_queue.task_done()
+            time.sleep(1)  # Небольшая задержка между запросами
+
+
+# === START ===
 @bot.message_handler(commands=["start"])
 def first_message(message):
     user_id = message.chat.id
@@ -104,7 +149,6 @@ def start_test(message):
         "answers": [],
         "current_q": 0,
         "last_msg_id": None,
-        "awaiting_photo": False,
         "characteristic": None,
     }
     send_question(user_id)
@@ -120,11 +164,8 @@ def send_question(user_id):
     q = QUESTIONS[q_index]
     markup = telebot.types.InlineKeyboardMarkup()
 
-    # Используем индексы вместо полного текста для callback_data
     for idx, opt in enumerate(q["options"]):
-        # callback_data должен быть коротким (1-64 байта)
-        markup.add(telebot.types.InlineKeyboardButton(
-            opt, callback_data=f"opt_{idx}"))
+        markup.add(telebot.types.InlineKeyboardButton(opt, callback_data=f"opt_{idx}"))
 
     markup.add(
         telebot.types.InlineKeyboardButton(
@@ -138,8 +179,7 @@ def send_question(user_id):
         except Exception:
             pass
 
-    msg = bot.send_message(
-        user_id, f"❓ {q['question_text']}", reply_markup=markup)
+    msg = bot.send_message(user_id, f"❓ {q['question_text']}", reply_markup=markup)
     user_data[user_id]["last_msg_id"] = msg.message_id
 
 
@@ -148,14 +188,13 @@ def handle_answer(call):
     user_id = call.message.chat.id
     data = user_data.get(user_id)
 
-    # отвечаем один раз — дальше повторять нельзя
     try:
         bot.answer_callback_query(call.id)
     except Exception:
-        logger.warning("Failed to answer callback_query %s",
-                       call.id, exc_info=True)
+        logger.warning("Failed to answer callback_query %s", call.id, exc_info=True)
 
     if call.data == "start_test":
+
         class MockMessage:
             def __init__(self, chat_id):
                 self.chat = type("Chat", (), {"id": chat_id})()
@@ -173,13 +212,13 @@ def handle_answer(call):
     if call.data == "message_from_author":
         bot.send_message(
             user_id,
-            "Дорогие дамы я надеюсь вы поняли что все тесты полная хуйня, огромное вам спасибо что вы есть. Оставайтесь такими какие есть вы все крутые😘😘😘. Обняли🫂."
+            "Дорогие дамы я надеюсь вы поняли что все тесты полная хуйня, огромное вам спасибо что вы есть. Оставайтесь такими какие есть вы все крутые😘😘😘. Обняли🫂.",
         )
         user_data.pop(user_id, None)
         return
 
     if not data:
-        return  # можно отправить текст первым вызовом, если нужно уведомление
+        return
 
     if call.data.startswith("opt_"):
         try:
@@ -195,8 +234,12 @@ def handle_answer(call):
 
         selected_option = question["options"][opt_index]
         data["answers"].append(
-            {"question": question["question_text"],
-                "options": question["options"], "answer": selected_option}
+            {
+                "question": question["question_text"],
+                "options": question["options"],
+                "answer": selected_option,
+                "is_custom": False,
+            }
         )
         data["current_q"] += 1
 
@@ -219,7 +262,12 @@ def handle_custom_input(message):
     question = QUESTIONS[q_index]
 
     data["answers"].append(
-        {"question": question["question_text"], "answer": message.text}
+        {
+            "question": question["question_text"],
+            "options": question["options"],
+            "answer": message.text,
+            "is_custom": True,
+        }
     )
     data["current_q"] += 1
 
@@ -232,6 +280,28 @@ def handle_custom_input(message):
     send_question(user_id)
 
 
+def format_answers_summary(answers):
+    """Форматирует ответы пользователя для отображения"""
+    summary = "📋 *Твои ответы:*\n\n"
+    
+    for i, answer_data in enumerate(answers, 1):
+        summary += f"*{i}. {answer_data['question']}*\n"
+        
+        if answer_data.get("is_custom"):
+            # Пользовательский ответ как цитата
+            summary += f"_{answer_data['answer']}_\n\n"
+        else:
+            # Показываем все варианты, выделяя выбранный жирным
+            for opt in answer_data.get("options", []):
+                if opt == answer_data["answer"]:
+                    summary += f"• *{opt}*\n"
+                else:
+                    summary += f"• {opt}\n"
+            summary += "\n"
+    
+    return summary
+
+
 def finish_test(user_id):
     data = user_data[user_id]
 
@@ -240,24 +310,99 @@ def finish_test(user_id):
     except Exception:
         pass
 
+    # Показываем все ответы перед обработкой
+    answers_summary = format_answers_summary(data["answers"])
+    bot.send_message(
+        user_id,
+        answers_summary,
+        parse_mode="Markdown",
+    )
+    
+    bot.send_message(
+        user_id,
+        "🤖 Отлично! Пока мы обрабатываем твои ответы, ты можешь их посмотреть и обсудить с друзьями.\n\n"
+        "Генерация характеристики и портрета может занять пару минут... 💅",
+    )
+
+    # Подготовка данных для LLM
     answers_json = json.dumps(
         data["answers"],
         ensure_ascii=False,
         indent=2,
     )
 
-    characteristic = generate_characteristic(answers_json)
-    data["characteristic"] = characteristic
-    data["awaiting_photo"] = True
-    data["last_msg_id"] = None
+    # Добавляем задачу в очередь
+    def on_characteristic_complete(uid, characteristic, error):
+        if error:
+            bot.send_message(
+                uid,
+                "Произошла ошибка при генерации характеристики. Попробуй позже.",
+            )
+            return
+        
+        data["characteristic"] = characteristic
+        
+        # Теперь генерируем изображение
+        def on_image_complete(uid, image_payload, error):
+            if error:
+                bot.send_message(
+                    uid,
+                    f"🧠 {characteristic}\n\n"
+                    "К сожалению, не удалось сгенерировать портрет. Но характеристика готова!",
+                    parse_mode="HTML",
+                )
+                return
+            
+            # Отправляем изображение и характеристику
+            send_final_result(uid, characteristic, image_payload)
+        
+        openrouter_queue.put({
+            "type": "image",
+            "user_id": uid,
+            "description": characteristic,
+            "callback": on_image_complete,
+        })
+    
+    openrouter_queue.put({
+        "type": "characteristic",
+        "user_id": user_id,
+        "answers_json": answers_json,
+        "callback": on_characteristic_complete,
+    })
 
+
+def send_final_result(user_id, characteristic, image_payload):
+    """Отправляет финальный результат: изображение и характеристику"""
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(
+        telebot.types.InlineKeyboardButton(
+            text="Сообщение от авторов", callback_data="message_from_author"
+        )
+    )
+
+    # Обработка URL в формате data:image/
+    if image_payload["kind"] == "url" and image_payload["data"].startswith("data:image/"):
+        header, b64_data = image_payload["data"].split(",", 1)
+        mime = header.split(";")[0].split(":", 1)[1]
+        image_payload = {"kind": "base64", "data": b64_data, "mime": mime}
+
+    # Отправка изображения
+    if image_payload["kind"] == "url":
+        logger.info("Sending image to Telegram via URL")
+        bot.send_photo(user_id, image_payload["data"])
+    else:
+        logger.info("Sending image to Telegram via base64 (%s bytes)", len(image_payload["data"]))
+        image_bytes = base64.b64decode(image_payload["data"])
+        bio = BytesIO(image_bytes)
+        bio.name = "character.png"
+        bot.send_photo(user_id, bio)
+
+    # Отправка характеристики
     bot.send_message(
         user_id,
-        (
-            "Отлично! Теперь пришлите своё фото (селфи или портрет), оно нужно для подведения итогов.\n"
-            "Фото не сохраняется и никуда не передаётся — оно остаётся только в вашем телефоне.\n"
-            "Отправьте его как обычное фото, не как файл."
-        ),
+        f"🧠 {characteristic}",
+        parse_mode="HTML",
+        reply_markup=markup,
     )
 
 
@@ -291,16 +436,13 @@ def generate_characteristic(answers_json):
 
 
 # === IMG GEN (портрет) ===
-def generate_image(description, reference_image_b64=None, retries=2, backoff=3):
+def generate_image(description, retries=2, backoff=3):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
+    
     user_content = [{"type": "text", "text": description}]
-    if reference_image_b64:
-        user_content.append(
-            {"type": "input_image", "image_base64": reference_image_b64}
-        )
 
     body = {
         "model": TEXT2IMG_MODEL,
@@ -319,6 +461,7 @@ def generate_image(description, reference_image_b64=None, retries=2, backoff=3):
             header, b64_data = url.split(",", 1)
             mime = header.split(";")[0].split(":", 1)[1]
             return {"kind": "base64", "data": b64_data, "mime": mime}
+
         if isinstance(resource, str):
             if resource.startswith("data:image/"):
                 return from_data_url(resource)
@@ -342,8 +485,7 @@ def generate_image(description, reference_image_b64=None, retries=2, backoff=3):
                     return parsed
                 for key in ("image_base64", "b64_json"):
                     if block.get(key):
-                        logger.info(
-                            "Image payload received via %s in content", key)
+                        logger.info("Image payload received via %s in content", key)
                         return {
                             "kind": "base64",
                             "data": block[key],
@@ -360,8 +502,7 @@ def generate_image(description, reference_image_b64=None, retries=2, backoff=3):
                     )
                     return parsed
             if image_item.get("type") == "image_base64" and image_item.get("image_base64"):
-                logger.info(
-                    "Image payload received via image_base64 in images[]")
+                logger.info("Image payload received via image_base64 in images[]")
                 return {
                     "kind": "base64",
                     "data": image_item["image_base64"],
@@ -401,126 +542,14 @@ def generate_image(description, reference_image_b64=None, retries=2, backoff=3):
 
         logger.warning("No image found in response on attempt %d", attempt + 1)
 
-    raise RuntimeError(
-        f"No image payload found in OpenRouter response: {payload}")
-
-
-@bot.message_handler(content_types=["photo"])
-def handle_user_photo(message):
-    user_id = message.chat.id
-    data = user_data.get(user_id)
-    if not data or not data.get("awaiting_photo"):
-        return
-
-    try:
-        file_info = bot.get_file(message.photo[-1].file_id)
-        photo_bytes = bot.download_file(file_info.file_path)
-    except Exception:
-        logger.warning("Failed to download user photo for %s",
-                       user_id, exc_info=True)
-        bot.send_message(
-            user_id,
-            "Не удалось получить фото. Попробуй отправить его ещё раз как обычное изображение.",
-        )
-        return
-
-    photo_b64 = base64.b64encode(photo_bytes).decode("utf-8")
-    del photo_bytes
-
-    progress_msg = None
-    try:
-        with open("./cat-kitty.gif", "rb") as gif:
-            progress_msg = bot.send_animation(
-                chat_id=user_id,
-                animation=gif,
-                caption="🤖 Обрабатываем ваше фото... это займёт пару минут 💅",
-            )
-
-        image_payload = generate_image(
-            data["characteristic"],
-            reference_image_b64=photo_b64,
-        )
-    except Exception:
-        logger.exception("Photo-based generation failed for %s", user_id)
-        if progress_msg:
-            try:
-                bot.delete_message(user_id, progress_msg.message_id)
-            except Exception:
-                pass
-        bot.send_message(
-            user_id,
-            "Не вышло обработать фото. Пришли другое изображение или попробуй позже.",
-        )
-        data["awaiting_photo"] = True
-        photo_b64 = None
-        return
-    finally:
-        if progress_msg:
-            try:
-                bot.delete_message(user_id, progress_msg.message_id)
-            except Exception:
-                pass
-        photo_b64 = None
-
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(
-        telebot.types.InlineKeyboardButton(
-            text="Сообщение от авторов", callback_data="message_from_author"
-        )
-    )
-
-    if image_payload["kind"] == "url" and image_payload["data"].startswith("data:image/"):
-        header, b64_data = image_payload["data"].split(",", 1)
-        mime = header.split(";")[0].split(":", 1)[1]
-        image_payload = {"kind": "base64", "data": b64_data, "mime": mime}
-
-    if image_payload["kind"] == "url":
-        logger.info("Sending image to Telegram via URL (no caption)")
-        bot.send_photo(user_id, image_payload["data"])
-    else:
-        logger.info(
-            "Sending image to Telegram via base64 (%s bytes)",
-            len(image_payload["data"]),
-        )
-        image_bytes = base64.b64decode(image_payload["data"])
-        bio = BytesIO(image_bytes)
-        bio.name = "character.png"
-        bot.send_photo(user_id, bio)
-
-    bot.send_message(
-        user_id,
-        f"🧠 {data['characteristic']}",
-        parse_mode="HTML",
-        reply_markup=markup,
-    )
-    data["awaiting_photo"] = False
-
-
-@bot.message_handler(
-    func=lambda message: user_data.get(
-        message.chat.id, {}).get("awaiting_photo"),
-    content_types=[
-        "text",
-        "document",
-        "audio",
-        "video",
-        "voice",
-        "video_note",
-        "sticker",
-        "animation",
-        "location",
-        "contact",
-    ],
-)
-def handle_non_photo_during_upload(message):
-    bot.send_message(
-        message.chat.id,
-        "Чтобы продолжить, пришли своё фото как обычное изображение. "
-        "Мы его не сохраняем и никому не передаём.",
-    )
+    raise RuntimeError(f"No image payload found in OpenRouter response: {payload}")
 
 
 logger = setup_logging()
+
+# Запускаем worker thread для обработки очереди OpenRouter
+worker_thread = Thread(target=openrouter_worker, daemon=True)
+worker_thread.start()
 
 bot.remove_webhook()
 
