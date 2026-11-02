@@ -149,7 +149,7 @@ def first_message(message):
     )
     bot.send_message(
         message.from_user.id,
-        "Готовы начинать?😈😈😈",
+        "Готова начинать?😈😈😈",
         reply_markup=markup,
     )
 
@@ -175,16 +175,19 @@ def send_question(user_id):
         return finish_test(user_id)
 
     q = QUESTIONS[q_index]
-    markup = telebot.types.InlineKeyboardMarkup()
-
-    for idx, opt in enumerate(q["options"]):
-        markup.add(telebot.types.InlineKeyboardButton(opt, callback_data=f"opt_{idx}"))
-
-    markup.add(
-        telebot.types.InlineKeyboardButton(
-            "✏️ Свой вариант", callback_data="custom_input"
+    markup = None
+    question_text = f"❓ {q['question_text']}"
+    if q["options"]:
+        markup = telebot.types.InlineKeyboardMarkup()
+        for idx, opt in enumerate(q["options"]):
+            markup.add(telebot.types.InlineKeyboardButton(opt, callback_data=f"opt_{idx}"))
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                "✏️ Свой вариант", callback_data="custom_input"
+            )
         )
-    )
+    else:
+        question_text += "\n\n✍️ Напиши ответ сообщением."
 
     if data["last_msg_id"]:
         try:
@@ -192,8 +195,10 @@ def send_question(user_id):
         except Exception:
             pass
 
-    msg = bot.send_message(user_id, f"❓ {q['question_text']}", reply_markup=markup)
+    msg = bot.send_message(user_id, question_text, reply_markup=markup)
     user_data[user_id]["last_msg_id"] = msg.message_id
+    if not q["options"]:
+        bot.register_next_step_handler(msg, handle_custom_input)
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -269,6 +274,11 @@ def handle_custom_input(message):
     data = user_data.get(user_id)
     if not data:
         bot.send_message(user_id, "Начни с /start")
+        return
+
+    if not message.text or not message.text.strip():
+        msg = bot.send_message(user_id, "✍️ Напиши ответ текстом.")
+        bot.register_next_step_handler(msg, handle_custom_input)
         return
 
     q_index = data["current_q"]
