@@ -1,37 +1,51 @@
 import telebot
 import json
 import time
-import requests
 import logging
-import base64
-from io import BytesIO
 import argparse
+import os
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
-from threading import Thread, Lock
+from threading import Thread
+
+from routerai_client import RouterAIClient
+
+
+logger = logging.getLogger(__name__)
 
 
 # === CONFIG ===
-BOT_TOKEN = "8465030829:AAG3-7ZIQGiTuWwhUeQNsv66f24mabMwqcY"
-bot = telebot.TeleBot(BOT_TOKEN)
-QUESTIONS_PATH = "questions.json"
-PROMPTS_PATH = "prompts.json"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_API_KEY = (
-    "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"
-)
-LLM_MODEL = "x-ai/grok-4-fast"
-TEXT2IMG_MODEL = "openai/gpt-5-image"
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
+SETTINGS = {}
+if CONFIG_PATH.exists():
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        SETTINGS = json.load(f)
+if not isinstance(SETTINGS, dict):
+    raise ValueError("config.json must contain a JSON object")
 
-PHOTO_CAPTION_LIMIT = 1024
+
+def get_setting(name, default=None):
+    value = os.environ.get(name, SETTINGS.get(name, default))
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Set {name} in config.json or environment variables")
+    return value.strip()
+
+
+BOT_TOKEN = get_setting("BOT_TOKEN")
+ROUTERAI_API_KEY = get_setting("ROUTERAI_API_KEY")
+LLM_MODEL = get_setting("LLM_MODEL", "x-ai/grok-4.7")
+TEXT2IMG_MODEL = get_setting("TEXT2IMG_MODEL", "openai/gpt-5-image")
+bot = telebot.TeleBot(BOT_TOKEN)
+QUESTIONS_PATH = BASE_DIR / "questions.json"
+PROMPTS_PATH = BASE_DIR / "prompts.json"
 
 # === STORAGE ===
 user_data = {}
 
-# === QUEUE FOR OPENROUTER REQUESTS ===
-openrouter_queue = Queue()
-queue_lock = Lock()
+# === QUEUE FOR ROUTERAI REQUESTS ===
+routerai_queue = Queue()
 
 # === LOAD QUESTIONS & PROMPTS ===
 with open(QUESTIONS_PATH, "r", encoding="utf-8") as f:
@@ -40,7 +54,15 @@ with open(QUESTIONS_PATH, "r", encoding="utf-8") as f:
 with open(PROMPTS_PATH, "r", encoding="utf-8") as f:
     PROMPTS = json.load(f)
 REPORT_PROMPT = PROMPTS["report"]
-IMG_GEN_PROMPT = PROMPTS["img_gen"]
+IMG_GEN_PROMPT = PROMPTS.get("img_gen")
+
+routerai_client = RouterAIClient(
+    api_key=ROUTERAI_API_KEY,
+    model=LLM_MODEL,
+    report_prompt=REPORT_PROMPT,
+    image_model=TEXT2IMG_MODEL,
+    image_prompt=IMG_GEN_PROMPT,
+)
 
 # === LOGGING SETUP ===
 
@@ -81,11 +103,11 @@ def setup_logging() -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-# === OPENROUTER QUEUE WORKER ===
-def openrouter_worker():
-    """Обрабатывает запросы к OpenRouter по одному из очереди"""
+# === ROUTERAI QUEUE WORKER ===
+def routerai_worker():
+    """Обрабатывает запросы к RouterAI по одному из очереди"""
     while True:
-        task = openrouter_queue.get()
+        task = routerai_queue.get()
         if task is None:
             break
         
@@ -96,26 +118,17 @@ def openrouter_worker():
             if task_type == "characteristic":
                 answers_json = task["answers_json"]
                 try:
-                    characteristic = generate_characteristic(answers_json)
+                    characteristic = routerai_client.generate_characteristic(answers_json)
                     task["callback"](user_id, characteristic, None)
                 except Exception as e:
                     logger.exception("Failed to generate characteristic for %s", user_id)
                     task["callback"](user_id, None, str(e))
             
-            elif task_type == "image":
-                description = task["description"]
-                try:
-                    image_payload = generate_image(description)
-                    task["callback"](user_id, image_payload, None)
-                except Exception as e:
-                    logger.exception("Failed to generate image for %s", user_id)
-                    task["callback"](user_id, None, str(e))
-        
         except Exception as e:
-            logger.exception("Unexpected error in openrouter_worker")
+            logger.exception("Unexpected error in routerai_worker")
         
         finally:
-            openrouter_queue.task_done()
+            routerai_queue.task_done()
             time.sleep(1)  # Небольшая задержка между запросами
 
 
@@ -320,8 +333,8 @@ def finish_test(user_id):
     
     bot.send_message(
         user_id,
-        "🤖 Отлично! Пока мы обрабатываем твои ответы, ты можешь их посмотреть и обсудить с друзьями.\n\n"
-        "Генерация характеристики и портрета может занять пару минут... 💅",
+        "🤖 Отлично! Пока наш индусский специалист анализирует твои ответы, ты можешь их посмотреть и обсудить с друзьями.\n\n"
+        "Написание твоей характеристики может занять пару минут... 💅",
     )
 
     # Подготовка данных для LLM
@@ -342,28 +355,11 @@ def finish_test(user_id):
         
         data["characteristic"] = characteristic
         
-        # Теперь генерируем изображение
-        def on_image_complete(uid, image_payload, error):
-            if error:
-                bot.send_message(
-                    uid,
-                    f"🧠 {characteristic}\n\n"
-                    "К сожалению, не удалось сгенерировать портрет. Но характеристика готова!",
-                    parse_mode="HTML",
-                )
-                return
-            
-            # Отправляем изображение и характеристику
-            send_final_result(uid, characteristic, image_payload)
-        
-        openrouter_queue.put({
-            "type": "image",
-            "user_id": uid,
-            "description": characteristic,
-            "callback": on_image_complete,
-        })
-    
-    openrouter_queue.put({
+        # Генерация портрета временно отключена.
+        # image_payload = routerai_client.generate_image(characteristic)
+        send_final_result(uid, characteristic)
+
+    routerai_queue.put({
         "type": "characteristic",
         "user_id": user_id,
         "answers_json": answers_json,
@@ -371,31 +367,14 @@ def finish_test(user_id):
     })
 
 
-def send_final_result(user_id, characteristic, image_payload):
-    """Отправляет финальный результат: изображение и характеристику"""
+def send_final_result(user_id, characteristic):
+    """Отправляет характеристику и кнопку сообщения от авторов."""
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(
         telebot.types.InlineKeyboardButton(
             text="Сообщение от авторов", callback_data="message_from_author"
         )
     )
-
-    # Обработка URL в формате data:image/
-    if image_payload["kind"] == "url" and image_payload["data"].startswith("data:image/"):
-        header, b64_data = image_payload["data"].split(",", 1)
-        mime = header.split(";")[0].split(":", 1)[1]
-        image_payload = {"kind": "base64", "data": b64_data, "mime": mime}
-
-    # Отправка изображения
-    if image_payload["kind"] == "url":
-        logger.info("Sending image to Telegram via URL")
-        bot.send_photo(user_id, image_payload["data"])
-    else:
-        logger.info("Sending image to Telegram via base64 (%s bytes)", len(image_payload["data"]))
-        image_bytes = base64.b64decode(image_payload["data"])
-        bio = BytesIO(image_bytes)
-        bio.name = "character.png"
-        bot.send_photo(user_id, bio)
 
     # Отправка характеристики
     bot.send_message(
@@ -406,153 +385,13 @@ def send_final_result(user_id, characteristic, image_payload):
     )
 
 
-# === LLM (характеристика) ===
-def generate_characteristic(answers_json):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": REPORT_PROMPT},
-            {"role": "user", "content": answers_json},
-        ],
-    }
+if __name__ == "__main__":
+    logger = setup_logging()
 
-    response = requests.post(
-        OPENROUTER_URL,
-        headers=headers,
-        data=json.dumps(body, ensure_ascii=False),
-        timeout=90,
+    worker_thread = Thread(target=routerai_worker, daemon=True)
+    worker_thread.start()
+
+    bot.remove_webhook()
+    bot.infinity_polling(
+        timeout=20, long_polling_timeout=20, allowed_updates=["message", "callback_query"]
     )
-    response.raise_for_status()
-    payload = response.json()
-
-    try:
-        return payload["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Unexpected OpenRouter response: {payload}")
-
-
-# === IMG GEN (портрет) ===
-def generate_image(description, retries=2, backoff=3):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    
-    user_content = [{"type": "text", "text": description}]
-
-    body = {
-        "model": TEXT2IMG_MODEL,
-        "modalities": ["image"],
-        "messages": [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": IMG_GEN_PROMPT}],
-            },
-            {"role": "user", "content": user_content},
-        ],
-    }
-
-    def parse_image_resource(resource):
-        def from_data_url(url: str):
-            header, b64_data = url.split(",", 1)
-            mime = header.split(";")[0].split(":", 1)[1]
-            return {"kind": "base64", "data": b64_data, "mime": mime}
-
-        if isinstance(resource, str):
-            if resource.startswith("data:image/"):
-                return from_data_url(resource)
-            return {"kind": "url", "data": resource}
-        if isinstance(resource, dict) and resource.get("url"):
-            inner_url = resource["url"]
-            if isinstance(inner_url, str) and inner_url.startswith("data:image/"):
-                return from_data_url(inner_url)
-            return {"kind": "url", "data": inner_url}
-        return None
-
-    def extract_image(message):
-        for block in message.get("content") or []:
-            if isinstance(block, dict) and block.get("type") == "output_image":
-                image_url = block.get("image_url")
-                parsed = parse_image_resource(image_url)
-                if parsed:
-                    logger.info(
-                        "Image payload received via content (kind=%s)", parsed["kind"]
-                    )
-                    return parsed
-                for key in ("image_base64", "b64_json"):
-                    if block.get(key):
-                        logger.info("Image payload received via %s in content", key)
-                        return {
-                            "kind": "base64",
-                            "data": block[key],
-                            "mime": block.get("mime_type", "image/png"),
-                        }
-        for image_item in message.get("images") or []:
-            if not isinstance(image_item, dict):
-                continue
-            if image_item.get("type") == "image_url":
-                parsed = parse_image_resource(image_item.get("image_url"))
-                if parsed:
-                    logger.info(
-                        "Image payload received via images[] (kind=%s)", parsed["kind"]
-                    )
-                    return parsed
-            if image_item.get("type") == "image_base64" and image_item.get("image_base64"):
-                logger.info("Image payload received via image_base64 in images[]")
-                return {
-                    "kind": "base64",
-                    "data": image_item["image_base64"],
-                    "mime": image_item.get("mime_type", "image/png"),
-                }
-        return None
-
-    for attempt in range(retries + 1):
-        response = requests.post(
-            OPENROUTER_URL,
-            headers=headers,
-            json=body,
-            timeout=240,
-        )
-        response.raise_for_status()
-        payload = response.json()
-
-        choice = (payload.get("choices") or [{}])[0]
-        error_block = choice.get("error")
-        if error_block:
-            logger.warning(
-                "Image generation error (code=%s, req_id=%s): %s",
-                error_block.get("code"),
-                error_block.get("metadata", {}).get("provider_request_id")
-                or error_block.get("metadata", {}).get("request_id"),
-                error_block.get("message"),
-            )
-            if attempt < retries:
-                time.sleep(backoff * (attempt + 1))
-                continue
-            raise RuntimeError(f"Image generation failed: {payload}")
-
-        message = choice.get("message") or {}
-        image_payload = extract_image(message)
-        if image_payload:
-            return image_payload
-
-        logger.warning("No image found in response on attempt %d", attempt + 1)
-
-    raise RuntimeError(f"No image payload found in OpenRouter response: {payload}")
-
-
-logger = setup_logging()
-
-# Запускаем worker thread для обработки очереди OpenRouter
-worker_thread = Thread(target=openrouter_worker, daemon=True)
-worker_thread.start()
-
-bot.remove_webhook()
-
-bot.infinity_polling(
-    timeout=20, long_polling_timeout=20, allowed_updates=["message", "callback_query"]
-)
